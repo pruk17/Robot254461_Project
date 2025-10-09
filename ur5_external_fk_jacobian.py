@@ -1,128 +1,150 @@
-# UR5 - Final-only print of FK vs Scene (Threaded Python Script)
-# --------------------------------------------------------------
-# - Captures the last joint angles and EndPoint poses during the run.
-# - Prints ONCE at the end (sysCall_cleanup) in the same console window.
-# - Shows only the final EndPoint pose (predicted FK and simulated scene).
-# - Comments are in English.
+# UR5 FK using your DH_Base, DH, DH_EE and th_offset (CoppeliaSim Threaded Python)
+# - Reads joint angles during the run and remembers the last ones
+# - On cleanup, computes forward kinematics with the given DH sets
+# - Prints ONLY the final sample: FK (predicted) vs scene (simulated)
+# - English comments; no extra window; simple formatting
 
 import math
 import time
 import numpy as np
 
-pi = np.pi
+# ----------------- User DH specification (exactly as requested) -----------------
+pi = math.pi
 d2r = pi/180.0
-r2d = 1.0/d2r
+r2d = 180.0/pi
 
-# ---- EDIT HERE: UR5 DH table (alpha, a, d, theta_offset) ----
-JOINTS = [
-    # alpha,      a,        d,        theta_offset (added to measured joint)
-    (0.0,         0.0,      0.0892,   -np.pi/2),   # joint 1
-    (np.pi/2,     0.0,      0.0,      +np.pi/2),   # joint 2
-    (0.0,         0.4251,   0.0,      0.0),        # joint 3
-    (0.0,         0.39215,  0.11,     +np.pi/2),   # joint 4
-    (np.pi/2,     0.0,      0.09475,  0.0),        # joint 5
-    (-np.pi/2,    0.0,      0.26658,  0.0),        # joint 6 (tool flange->TCP length)
-]
+# From Base to Frame 0
+DH_Base = np.array([[0.0, 0.0, 0.0892, -pi/2]], dtype=float)   # (alpha, a, d, theta_fixed)
 
+# Main chain 1..6
+DH = np.array([
+    [0.0,       0.0,      0.0,     0.0],
+    [pi/2,      0.0,      0.0,     0.0],
+    [0.0,       0.4251,   0.0,     0.0],
+    [0.0,       0.39215,  0.11,    0.0],
+    [-pi/2,     0.0,      0.09475, 0.0],
+    [pi/2,      0.0,      0.0,     0.0],
+], dtype=float)
+
+# From Frame 6 to End-Effector (tool flange -> TCP)
+DH_EE = np.array([[0.0, 0.0, 0.26658, pi]], dtype=float)
+
+# Joint-angle offsets for the current home position
+th_offset = np.array([0.0, pi/2, 0.0, -pi/2, 0.0, 0.0], dtype=float)
+
+# Optional: set this True to run the given "Test 1" pose instead of the last scene pose
+RUN_TEST_1 = False
+TEST1_DEG  = np.array([10, 20, 30, 40, 50, 60], dtype=float)
+
+# ---------------------------- Helpers ------------------------------------------
 def dh_transform_matrix(alpha, a, d, theta):
-    """Classic DH homogeneous transform that matches your working file."""
+    """Classic DH transform (alpha, a, d, theta)."""
     ca = math.cos(alpha); sa = math.sin(alpha)
     ct = math.cos(theta); st = math.sin(theta)
-    return np.array([
-        [   ct,   -st,   0.0,   a     ],
-        [st*ca, ct*ca,  -sa,  -d*sa  ],
-        [st*sa, ct*sa,   ca,   d*ca  ],
-        [ 0.0 ,  0.0 ,  0.0,   1.0   ]
+    # Same layout as your reference implementation
+    A = np.array([
+        [   ct,    -st,    0.0,    a],
+        [st*ca,  ct*ca,   -sa,  -d*sa],
+        [st*sa,  ct*sa,    ca,   d*ca],
+        [  0.0,    0.0,   0.0,   1.0]
     ], dtype=float)
+    return A
 
-def rotmat_to_euler_XYZ(R):
-    """Intrinsic X-Y-Z Euler like CoppeliaSim."""
+def rotmat_to_euler_xyz(R):
+    """CoppeliaSim-like intrinsic X-Y-Z Euler from a rotation matrix."""
     EPS = 1e-9
-    r02 = float(R[0,2])
+    r02 = float(R[0, 2])
     r02 = max(-1.0, min(1.0, r02))
     beta = math.asin(r02)  # Y
     if abs(r02) < 1.0 - EPS:
-        alpha = math.atan2(-R[1,2], R[2,2])   # X
-        gamma = math.atan2(-R[0,1], R[0,0])   # Z
+        alpha = math.atan2(-R[1, 2], R[2, 2])  # X
+        gamma = math.atan2(-R[0, 1], R[0, 0])  # Z
     else:
         alpha = 0.0
-        gamma = math.atan2(R[1,0], R[1,1])
+        gamma = math.atan2(R[1, 0], R[1, 1])
     return np.array([alpha, beta, gamma], dtype=float)
 
-def ur5_fk(theta):
-    """Forward kinematics from the editable DH table above."""
-    T = np.eye(4, dtype=float)
-    for i, (alpha, a, d, th_off) in enumerate(JOINTS):
-        T = T @ dh_transform_matrix(alpha, a, d, theta[i] + th_off)
-    pos = T[:3, 3]
-    eul = rotmat_to_euler_XYZ(T[:3, :3])
-    return pos, eul, T
+def fk_from_dh(theta):
+    """Compute T0E = T_base * ?(T_i) * T_ee with the requested DH sets and offsets."""
+    # T_base
+    alpha, a, d, th_fixed = DH_Base[0]
+    T = dh_transform_matrix(alpha, a, d, th_fixed)
 
-# --------- global snapshot (final only) ---------
-_last_q = None
-_last_pos_sc = None
-_last_eul_sc = None
-_last_pos_fk = None
-_last_eul_fk = None
-_last_T0E = None
+    # chain 1..6 (theta_i + offset_i)
+    for i in range(6):
+        alpha, a, d, th_fixed = DH[i]
+        th = float(theta[i] + th_offset[i] + th_fixed)
+        T = T @ dh_transform_matrix(alpha, a, d, th)
 
+    # T_ee
+    alpha, a, d, th_fixed = DH_EE[0]
+    T = T @ dh_transform_matrix(alpha, a, d, th_fixed)
+    return T
+
+def fmt_T(T):
+    """Format a 4x4 nicely."""
+    rows = []
+    for r in range(4):
+        rows.append("  {:+.6f}  {:+.6f}  {:+.6f}  {:+.6f}".format(T[r,0], T[r,1], T[r,2], T[r,3]))
+    return "\n".join(rows)
+
+# ---------------------------- CoppeliaSim hooks --------------------------------
 def sysCall_init():
-    # Use CoppeliaSim's embedded Python "require"
-    global sim
-    sim = require('sim')
+    # Python wrapper v2 provides "sim" via require
+    global sim, h_j, h_tip, last_theta
+    sim = require("sim")
 
-def _snapshot(h_j, h_end):
-    """Read actual joint angles and scene EndPoint pose, compute FK from those angles."""
-    q = [sim.getJointPosition(h_j[i]) for i in range(6)]
-    pos_fk, eul_fk, T0E = ur5_fk(q)
-    pos_sc = sim.getObjectPosition(h_end, -1)        # world
-    eul_sc = sim.getObjectOrientation(h_end, -1)     # world, XYZ
-    return q, pos_fk, eul_fk, T0E, pos_sc, eul_sc
+    # Joint handles (same order as the scene)
+    h_j = [
+        sim.getObject("/UR5/joint"),
+        sim.getObject("/UR5/joint/link/joint"),
+        sim.getObject("/UR5/joint/link/joint/link/joint"),
+        sim.getObject("/UR5/joint/link/joint/link/joint/link/joint"),
+        sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint"),
+        sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint"),
+    ]
+    h_tip = sim.getObject("/UR5/EndPoint")
+    last_theta = np.zeros(6, dtype=float)
 
 def sysCall_thread():
-    # Handles
-    h_j = {}
-    h_j[0] = sim.getObject("/UR5/joint")
-    h_j[1] = sim.getObject("/UR5/joint/link/joint")
-    h_j[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
-    h_j[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
-    h_j[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
-    h_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
-    h_end = sim.getObject("/UR5/EndPoint")
-
-    # Loop until the simulation stops; do NOT print per step.
+    # Just sample joint angles while simulation runs
+    global last_theta
     while sim.getSimulationState() != sim.simulation_stopped:
-        q, pos_fk, eul_fk, T0E, pos_sc, eul_sc = _snapshot(h_j, h_end)
-
-        global _last_q, _last_pos_sc, _last_eul_sc, _last_pos_fk, _last_eul_fk, _last_T0E
-        _last_q = q
-        _last_pos_sc = pos_sc
-        _last_eul_sc = eul_sc
-        _last_pos_fk = pos_fk
-        _last_eul_fk = eul_fk
-        _last_T0E = T0E
-
+        # read current joints (in radians)
+        cur = [sim.getJointPosition(h) for h in h_j]
+        last_theta = np.array(cur, dtype=float)
+        # small yield
+        time.sleep(0.02)
         sim.switchThread()
 
-def _fmt_vec3(v):
-    return f"[{float(v[0]):+0.6f}, {float(v[1]):+0.6f}, {float(v[2]):+0.6f}]"
-
 def sysCall_cleanup():
-    if _last_q is None:
-        print("No final data captured.")
-        return
+    # Decide which joint angles to use: last scene pose or TEST 1
+    if RUN_TEST_1:
+        theta = TEST1_DEG * d2r
+    else:
+        theta = last_theta
 
-    q_deg = [round(qi*r2d, 3) for qi in _last_q]
-    eul_fk_deg = [round(float(e)*r2d, 3) for e in _last_eul_fk]
-    eul_sc_deg = [round(float(e)*r2d, 3) for e in _last_eul_sc]
+    # Predicted FK from DH sets
+    T0E = fk_from_dh(theta)
+    p_fk = T0E[:3, 3]
+    eul_fk = rotmat_to_euler_xyz(T0E[:3, :3]) * r2d
 
+    # Scene pose (simulated) for the same final instant
+    p_sim = np.array(sim.getObjectPosition(h_tip, -1), dtype=float)
+    eul_sim = np.array(sim.getObjectOrientation(h_tip, -1), dtype=float) * r2d
+
+    # Print only once at the very end
     print("==================== FINAL ====================")
-    print(f"Joint angles (degrees): {q_deg}")
+    print("Joint angles (degrees): [{}]".format(
+        ", ".join("{:.3f}".format(x*r2d) for x in theta)
+    ))
 
     print("\nForward kinematics (predicted, world frame)")
-    print(f"  End point position: {_fmt_vec3(_last_pos_fk)}")
-    print(f"  End point orientation XYZ (degrees): {eul_fk_deg}")
+    print("  End point position: [{:+.6f}, {:+.6f}, {:+.6f}]".format(p_fk[0], p_fk[1], p_fk[2]))
+    print("  End point orientation XYZ (degrees): [{:.3f}, {:.3f}, {:.3f}]".format(eul_fk[0], eul_fk[1], eul_fk[2]))
+    print("  Homogeneous transform T0E:\n{}".format(fmt_T(T0E)))
 
     print("\nScene values (simulated, world frame)")
-    print(f"  End point position: {_fmt_vec3(_last_pos_sc)}")
-    print(f"  End point orientation XYZ (degrees): {eul_sc_deg}")
+    print("  End point position: [{:+.6f}, {:+.6f}, {:+.6f}]".format(p_sim[0], p_sim[1], p_sim[2]))
+    print("  End point orientation XYZ (degrees): [{:.3f}, {:.3f}, {:.3f}]".format(eul_sim[0], eul_sim[1], eul_sim[2]))
+    print("[done]")
