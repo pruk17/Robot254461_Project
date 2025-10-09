@@ -1,254 +1,128 @@
-#F:\StudyStuff_CMU\scripts>py -3.12 ur5_external_fk_jacobian.py
-"""
-UR5 Forward Kinematics & Jacobian (CoppeliaSim ZeroMQ Remote API)
------------------------------------------------------------------
-Changes in this version:
-1) Print labels in full words (no abbreviations). Example:
-   - "position_predicted" instead of "position_predicted"
-   - "position_simulated" instead of "position_simulated"
-   - "euler_XYZ_degrees_predicted" instead of "euler_XYZ_degrees_predicted"
-   - "euler_XYZ_degrees_simulated" instead of "euler_XYZ_degrees_simulated"
-   - "linear_velocity_x" / "angular_velocity_x" (Jacobian rows)
-2) Add a Denavit–Hartenberg (DH) table printer that lists rows in the order:
-   alpha, a, d, theta   (theta uses the mapping S*q + OFFS for each joint).
-3) Add clear English comments/docstrings to explain every step.
-"""
-# ur5_external_fk_jacobian.py
-# External Python via ZeroMQ Remote API:
-# - ใช้ DH table "ชุดล่าสุด" ตามที่ผู้ใช้ยืนยัน
-# - คาลิเบรต T6->tip ด้วย "มุมที่ใช้งานจริง" (หลัง mapping) เพื่อลด error เชิงเฟรม
-# - คำนวณ FK (pos + Euler X-Y-Z) และเทียบกับค่าจากซีน
-# - ดึง Jacobian แบบ robust ด้วย simIK.addElementFromScene + computeGroupJacobian
+# UR5 - Final-only print of FK vs Scene (Threaded Python Script)
+# --------------------------------------------------------------
+# - Captures the last joint angles and EndPoint poses during the run.
+# - Prints ONCE at the end (sysCall_cleanup) in the same console window.
+# - Shows only the final EndPoint pose (predicted FK and simulated scene).
+# - Comments are in English.
 
-#F:\StudyStuff_CMU\scripts>py -3.12 ur5_external_fk_jacobian.py
-import math, time
-from coppeliasim_zmqremoteapi_client import RemoteAPIClient
+import math
+import time
+import numpy as np
 
+pi = np.pi
+d2r = pi/180.0
+r2d = 1.0/d2r
 
-# (a_i, alpha_i, d_i) [m, rad]
-# DH = [
-
-
-def print_dh_table_alpha_a_d_theta():
-    """Print the current DH parameters in the order: alpha, a, d, theta.
-    - alpha [rad], a [m], d [m], theta expression uses the mapping S*q + OFFS.
-    This helps verify that your DH and angle mapping match the scene.
-    """
-    print("Denavit–Hartenberg table (alpha, a, d, theta):")
-    for i,(a, alpha, d) in enumerate(DH):
-        s = S[i] if i < len(S) else 1
-        offs = OFFS[i] if i < len(OFFS) else 0.0
-        theta_expr = f"{s}*q{i+1} + {offs}"
-        print(f"  joint {i+1}: alpha={alpha:.9f} rad, a={a:.6f} m, d={d:.6f} m, theta={theta_expr}")
-    print("-"*60)
-
-
-#     ( 0.0,           0.0,        0.0892 ),      # i=1
-#     ( -0.425,        +math.pi/2, 0.0    ),      # i=2
-#     ( -0.3922,       0.0,        0.0    ),      # i=3
-#     ( 0.0,           0.0,        0.0    ),      # i=4
-#     ( 0.0,           -math.pi/2, -0.03972),     # i=5
-#     ( 0.0,           +math.pi/2, 0.0    )       # i=6
-# ]
-
-DH = [
-    ( 0.0,           0.0,        0.0     ),     #i=1
-    ( 0.0,           +math.pi/2, 0.0     ),     # i=2 
-    ( 0.4251,        0.0,        0.0     ),     # i=3
-    ( 0.39215,       0.0,        0.11    ),     # i=4    
-    ( 0.0,           -math.pi/2, 0.09475),     # i=5
-    ( 0.0,           +math.pi/2, 0.0    )       # i=6
+# ---- EDIT HERE: UR5 DH table (alpha, a, d, theta_offset) ----
+JOINTS = [
+    # alpha,      a,        d,        theta_offset (added to measured joint)
+    (0.0,         0.0,      0.0892,   -np.pi/2),   # joint 1
+    (np.pi/2,     0.0,      0.0,      +np.pi/2),   # joint 2
+    (0.0,         0.4251,   0.0,      0.0),        # joint 3
+    (0.0,         0.39215,  0.11,     +np.pi/2),   # joint 4
+    (np.pi/2,     0.0,      0.09475,  0.0),        # joint 5
+    (-np.pi/2,    0.0,      0.26658,  0.0),        # joint 6 (tool flange->TCP length)
 ]
 
-# ========= Connect =========
-client = RemoteAPIClient('localhost', 23000)
-sim   = client.require('sim')
-simIK = client.require('simIK')
+def dh_transform_matrix(alpha, a, d, theta):
+    """Classic DH homogeneous transform that matches your working file."""
+    ca = math.cos(alpha); sa = math.sin(alpha)
+    ct = math.cos(theta); st = math.sin(theta)
+    return np.array([
+        [   ct,   -st,   0.0,   a     ],
+        [st*ca, ct*ca,  -sa,  -d*sa  ],
+        [st*sa, ct*sa,   ca,   d*ca  ],
+        [ 0.0 ,  0.0 ,  0.0,   1.0   ]
+    ], dtype=float)
 
-client.setStepping(True)
-if sim.getSimulationState() == sim.simulation_stopped:
-    sim.startSimulation()
-    # รอให้ซิมเริ่มจริง ๆ
-    for _ in range(60):
-        if sim.getSimulationState() != sim.simulation_stopped:
-            break
-        time.sleep(0.05)
+def rotmat_to_euler_XYZ(R):
+    """Intrinsic X-Y-Z Euler like CoppeliaSim."""
+    EPS = 1e-9
+    r02 = float(R[0,2])
+    r02 = max(-1.0, min(1.0, r02))
+    beta = math.asin(r02)  # Y
+    if abs(r02) < 1.0 - EPS:
+        alpha = math.atan2(-R[1,2], R[2,2])   # X
+        gamma = math.atan2(-R[0,1], R[0,0])   # Z
+    else:
+        alpha = 0.0
+        gamma = math.atan2(R[1,0], R[1,1])
+    return np.array([alpha, beta, gamma], dtype=float)
 
-# ========= Utilities =========
-def I4():
-    """Return 4x4 identity matrix."""
-    return [[1,0,0,0],
-            [0,1,0,0],
-            [0,0,1,0],
-            [0,0,0,1]]
+def ur5_fk(theta):
+    """Forward kinematics from the editable DH table above."""
+    T = np.eye(4, dtype=float)
+    for i, (alpha, a, d, th_off) in enumerate(JOINTS):
+        T = T @ dh_transform_matrix(alpha, a, d, theta[i] + th_off)
+    pos = T[:3, 3]
+    eul = rotmat_to_euler_XYZ(T[:3, :3])
+    return pos, eul, T
 
-def mmul(A,B):
-    """Matrix multiplication for 4x4 transforms."""
-    return [[sum(A[i][k]*B[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+# --------- global snapshot (final only) ---------
+_last_q = None
+_last_pos_sc = None
+_last_eul_sc = None
+_last_pos_fk = None
+_last_eul_fk = None
+_last_T0E = None
 
-def invRB(T):
-    # rigid transform inverse
-    R = [row[:3] for row in T[:3]]
-    Rt = [[R[j][i] for j in range(3)] for i in range(3)]
-    t  = [T[0][3], T[1][3], T[2][3]]
-    mt = [-sum(Rt[i][k]*t[k] for k in range(3)) for i in range(3)]
-    return [[Rt[0][0],Rt[0][1],Rt[0][2],mt[0]],
-            [Rt[1][0],Rt[1][1],Rt[1][2],mt[1]],
-            [Rt[2][0],Rt[2][1],Rt[2][2],mt[2]],
-            [0,0,0,1]]
+def sysCall_init():
+    # Use CoppeliaSim's embedded Python "require"
+    global sim
+    sim = require('sim')
 
-def T_DH(a, alpha, d, th):
-    """Classic DH homogeneous transform from (a, alpha, d, theta)."""
-    ca, sa = math.cos(alpha), math.sin(alpha)
-    ct, st = math.cos(th),    math.sin(th)
-    return [
-        [ ct,     -st*ca,   st*sa,  a*ct ],
-        [ st,      ct*ca,  -ct*sa,  a*st ],
-        [  0,         sa,      ca,     d ],
-        [  0,          0,       0,     1 ]
-    ]
+def _snapshot(h_j, h_end):
+    """Read actual joint angles and scene EndPoint pose, compute FK from those angles."""
+    q = [sim.getJointPosition(h_j[i]) for i in range(6)]
+    pos_fk, eul_fk, T0E = ur5_fk(q)
+    pos_sc = sim.getObjectPosition(h_end, -1)        # world
+    eul_sc = sim.getObjectOrientation(h_end, -1)     # world, XYZ
+    return q, pos_fk, eul_fk, T0E, pos_sc, eul_sc
 
-def mat12_to_4x4(M):
-    # CoppeliaSim poseToMatrix (12) -> 4x4
-    return [[M[0], M[3], M[6],  M[9]],
-            [M[1], M[4], M[7],  M[10]],
-            [M[2], M[5], M[8],  M[11]],
-            [0,0,0,1]]
+def sysCall_thread():
+    # Handles
+    h_j = {}
+    h_j[0] = sim.getObject("/UR5/joint")
+    h_j[1] = sim.getObject("/UR5/joint/link/joint")
+    h_j[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
+    h_j[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
+    h_j[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
+    h_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
+    h_end = sim.getObject("/UR5/EndPoint")
 
-def eulerXYZ_from_T(T):
-    # intrinsic X-Y-Z
-    r11,r12,r13 = T[0][0],T[0][1],T[0][2]
-    r21,r22,r23 = T[1][0],T[1][1],T[1][2]
-    r31,r32,r33 = T[2][0],T[2][1],T[2][2]
-    # clamp เพื่อกัน numeric drift
-    s = max(-1.0, min(1.0, -r31))
-    by = math.asin(s)           # Y
-    cx = math.atan2(r32, r33)   # X
-    cz = math.atan2(r21, r11)   # Z
-    return (cx,by,cz)
+    # Loop until the simulation stops; do NOT print per step.
+    while sim.getSimulationState() != sim.simulation_stopped:
+        q, pos_fk, eul_fk, T0E, pos_sc, eul_sc = _snapshot(h_j, h_end)
 
-def rad2deg(t):
-    return tuple(round(v*180.0/math.pi, 3) for v in t)
+        global _last_q, _last_pos_sc, _last_eul_sc, _last_pos_fk, _last_eul_fk, _last_T0E
+        _last_q = q
+        _last_pos_sc = pos_sc
+        _last_eul_sc = eul_sc
+        _last_pos_fk = pos_fk
+        _last_eul_fk = eul_fk
+        _last_T0E = T0E
 
-def fk_DH(q):
-    """Compute UR5 forward kinematics using DH and joint angles q[0..5]."""
-    T = I4()
-    for i,(a,al,d) in enumerate(DH):
-        T = mmul(T, T_DH(a, al, d, q[i]))
-    return T
+        sim.switchThread()
 
-# ========= Auto-detect joints & tip & base =========
-def find_endpoint_dummy():
-    try:
-        return sim.getObject('/UR5/EndPoint')
-    except:
-        pass
-    for h in sim.getObjectsInTree(sim.handle_scene, sim.object_dummy_type, 0):
-        name = sim.getObjectAlias(h, 1)
-        if name and 'endpoint' in name.lower():
-            return h
-    raise RuntimeError("ไม่พบ EndPoint dummy ในซีน")
+def _fmt_vec3(v):
+    return f"[{float(v[0]):+0.6f}, {float(v[1]):+0.6f}, {float(v[2]):+0.6f}]"
 
-def joints_from_tip(tip):
-    joints = []
-    node = tip
-    seen = set()
-    while True:
-        node = sim.getObjectParent(node)
-        if node == -1:
-            break
-        if sim.getObjectType(node) == sim.object_joint_type and sim.getJointType(node) == sim.joint_revolute_subtype:
-            if node not in seen:
-                joints.insert(0, node); seen.add(node)
-    return joints
+def sysCall_cleanup():
+    if _last_q is None:
+        print("No final data captured.")
+        return
 
-def find_base_link(first_joint):
-    # เดินขึ้นจนเจอ object ที่ไม่ใช่ joint (shape/dummy/model)
-    b = sim.getObjectParent(first_joint)
-    while b != -1 and sim.getObjectType(b) == sim.object_joint_type:
-        b = sim.getObjectParent(b)
-    return b if b != -1 else sim.handle_world
+    q_deg = [round(qi*r2d, 3) for qi in _last_q]
+    eul_fk_deg = [round(float(e)*r2d, 3) for e in _last_eul_fk]
+    eul_sc_deg = [round(float(e)*r2d, 3) for e in _last_eul_sc]
 
-tip    = find_endpoint_dummy()
-joints = joints_from_tip(tip)
-base   = find_base_link(joints[0])
+    print("==================== FINAL ====================")
+    print(f"Joint angles (degrees): {q_deg}")
 
-print("[info] joints:", [sim.getObjectAlias(j,1) for j in joints])
-print("[info] tip:", sim.getObjectAlias(tip,1))
-print("[info] base link:", sim.getObjectAlias(base,1) if base!=-1 else "<world>")
+    print("\nForward kinematics (predicted, world frame)")
+    print(f"  End point position: {_fmt_vec3(_last_pos_fk)}")
+    print(f"  End point orientation XYZ (degrees): {eul_fk_deg}")
 
-# ========= Mapping มุม (ค่าพื้นฐาน: ไม่ใช้ OFFS/S) =========
-#  - หากอยากกลับทิศ joint1 ให้ S[0] = -1 ได้ (เช่นบางซีน)
-S     = [ 1, 1, 1, 1, 1, 1 ]
-OFFS  = [ 0.0 ]*6
-
-def q_map_from_raw(q_raw):
-    """Map simulator joint angles to the DH convention via S*q + OFFS."""
-    # map = S*q + OFFS
-    return [ S[i]*q_raw[i] + OFFS[i] for i in range(6) ]
-
-# ========= Calibrate T6 -> tip (ใช้ "มุมที่ map แล้ว") =========
-def calibrate_T6_to_tip_mapped(q_raw):
-    qm = q_map_from_raw(q_raw)
-    T06 = fk_DH(qm)
-    T0_tip = mat12_to_4x4(sim.poseToMatrix(sim.getObjectPose(tip, sim.handle_world)))
-    return mmul(invRB(T06), T0_tip)
-
-q0 = [sim.getJointPosition(j) for j in joints]
-T6_to_tip = calibrate_T6_to_tip_mapped(q0)
-print("[info] calibrated T6->tip (with mapped angles)")
-
-# ========= IK group (robust Jacobian) =========
-ikEnv  = simIK.createEnvironment()
-ikGrp  = simIK.createGroup(ikEnv)
-target = sim.createDummy(0.01, None)
-sim.setObjectPose(target, sim.handle_world, sim.getObjectPose(tip, sim.handle_world))
-
-# สร้าง element อัตโนมัติจากซีน
-simIK.addElementFromScene(ikEnv, ikGrp, base, tip, target, simIK.constraint_pose)
-
-# ========= Helpers (แสดงผลครั้งเดียวตาม q กำหนด) =========
-def print_fk_and_jacobian_once(q_raw):
-    # (1) FK จาก DH
-    qm  = q_map_from_raw(q_raw)
-    T06 = fk_DH(qm)
-    T0_tip_pred = mmul(T06, T6_to_tip)
-    pos_fk  = (round(T0_tip_pred[0][3],4), round(T0_tip_pred[1][3],4), round(T0_tip_pred[2][3],4))
-    eul_fk  = rad2deg(eulerXYZ_from_T(T0_tip_pred))
-
-    # (2) ค่าจากซีน
-    T0_tip = mat12_to_4x4(sim.poseToMatrix(sim.getObjectPose(tip, sim.handle_world)))
-    position_simulated = (round(T0_tip[0][3],4), round(T0_tip[1][3],4), round(T0_tip[2][3],4))
-    eul_sim = rad2deg(eulerXYZ_from_T(T0_tip))
-
-    print(f"[Forward Kinematics] position_predicted {pos_fk} | position_simulated {position_simulated}")
-    print(f"[Forward Kinematics] euler_XYZ_degrees_predicted {eul_fk} | euler_XYZ_degrees_simulated {eul_sim}")
-
-    # (3) Jacobian (6 x dof)
-    Jlist, err = simIK.computeGroupJacobian(ikEnv, ikGrp)
-    dof = len(joints)
-    J = [Jlist[i*dof:(i+1)*dof] for i in range(6)]
-    print(f"[Jacobian] linear_velocity_x:{[round(v,4) for v in J[0]]}")
-    print(f"[Jacobian] linear_velocity_y:{[round(v,4) for v in J[1]]}")
-    print(f"[Jacobian] linear_velocity_z:{[round(v,4) for v in J[2]]}")
-    print(f"[Jacobian] angular_velocity_x:{[round(v,4) for v in J[3]]}")
-    print(f"[Jacobian] angular_velocity_y:{[round(v,4) for v in J[4]]}")
-    print(f"[Jacobian] angular_velocity_z:{[round(v,4) for v in J[5]]}")
-
-# ========= เดินซิมและแสดงผลหลายสเต็ป (ตัวอย่าง) =========
-for step in range(7):
-    client.step()
-    q = [sim.getJointPosition(j) for j in joints]
-    print("-"*60 if step>0 else "")
-    print_fk_and_jacobian_once(q)
-
-print("[done]")
-
-# ========= (ฟังก์ชันสำหรับใช้ในวิดีโอ/ทดลองด้วยมุมกำหนดเอง) =========
-def fk_and_jacobian_for_degrees(deg_list):
-    """
-    ใส่มุมองศา [θ1..θ6] เพื่อคำนวณ FK + Jacobian 1 ครั้ง
-    ใช้ตอนอัดวิดีโอ: ใส่มุมเองแล้วเรียกฟังก์ชันนี้
-    """
-    rad = [math.radians(d) for d in deg_list]
-    print_fk_and_jacobian_once(rad)
+    print("\nScene values (simulated, world frame)")
+    print(f"  End point position: {_fmt_vec3(_last_pos_sc)}")
+    print(f"  End point orientation XYZ (degrees): {eul_sc_deg}")
