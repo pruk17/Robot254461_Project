@@ -1,0 +1,43 @@
+sim=require'sim'
+
+function sysCall_init()
+    motorHandle=sim.getObject('../motor')
+    motorVelocity=0.01 -- m/s
+    motorForce=200 -- N
+
+    -- To change the color of the gripper, use following code:
+    --[[
+    local baseHandle=sim.getObject('..')
+    local objects=sim.getObjectsInTree(baseHandle)
+    for i=1,#objects,1 do
+        if sim.getObjectType(objects[i])==sim.sceneobject_shape then
+            -- Gripper colors:
+            sim.setShapeColor(objects[i],'P_GRIP_BLUE',sim.colorcomponent_ambient_diffuse,{1,0,0}) -- set to red
+            sim.setShapeColor(objects[i],'P_GRIP_WHITE',sim.colorcomponent_ambient_diffuse,{1,1,0}) -- set to yellow
+            sim.setShapeColor(objects[i],'P_GRIP_FINGER',sim.colorcomponent_ambient_diffuse,{1,1,1}) -- set to white
+        end
+    end
+    --]]
+
+end
+
+
+function sysCall_actuation()
+    -- You could also modulate the motor speed depending on the opening angle
+    local v=motorVelocity
+    local data=sim.getIntProperty(sim.handle_scene, 'signal.PGripRightAngle_motor', {noError = true})
+    if data and data~=0 then
+        v=-motorVelocity
+    end
+    sim.setJointTargetForce(motorHandle,motorForce)
+    sim.setJointTargetVelocity(motorHandle,v)
+end
+
+-- You have basically 2 alternatives to grasp an object:
+--
+-- 1. You try to grasp it in a realistic way. This is quite delicate and sometimes requires
+--    to carefully adjust several parameters (e.g. motor forces/torques/velocities, friction
+--    coefficients, object masses and inertias)
+--
+-- 2. You fake the grasping by attaching the object to the gripper via a connector. This is
+--    much easier and offers very stable results.

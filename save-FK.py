@@ -134,7 +134,7 @@ def sysCall_cleanup():
     print("  End point position: [{:+.5f}, {:+.5f}, {:+.5f}]".format(p_sim[0], p_sim[1], p_sim[2]))
     print("  End point orientation XYZ (degrees): [{:.2f}, {:.2f}, {:.2f}]".format(eul_sim[0], eul_sim[1], eul_sim[2]))
 
-    print("\nJacobian (GEOMETRIC, SPATIAL @ BASE; angular = ω)  [rows: linear x,y,z; angular x,y,z]")
+    print("\nJacobian (GEOMETRIC, SPATIAL @ BASE; angular(Omega))  [rows: linear x,y,z; angular x,y,z]")
     labels = ["linear x:", "linear y:", "linear z:", "angular x:", "angular y:", "angular z:"]
     for r in range(6):
         print("  {:11s} {}".format(labels[r], "  ".join("{:+.4f}".format(v) for v in J[r,:])))

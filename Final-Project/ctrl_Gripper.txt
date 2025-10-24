@@ -1,0 +1,12 @@
+# Open gripper
+sim.setInt32Signal('PGripRightAngle_cmd', 0)
+
+# Close gripper
+sim.setInt32Signal('PGripRightAngle_cmd', 1)
+
+# Hold (no motion)
+sim.setInt32Signal('PGripRightAngle_cmd', -1)
+
+# Optional overrides (you can set once at init)
+sim.setFloatSignal('PGripRightAngle_vel', 0.03)     # m/s
+sim.setFloatSignal('PGripRightAngle_force', 400.0)  # N

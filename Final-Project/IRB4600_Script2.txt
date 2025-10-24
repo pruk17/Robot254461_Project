@@ -1,0 +1,41 @@
+sim = require'sim'
+simIK = require'simIK'
+
+-- IRB4600 IK follower (THREAD-ONLY)
+-- Python (or another script) moves '/IRB4600/IkTarget' in WORLD.
+-- This script solves IK once per sim step so the arm follows.
+
+local base, tip, target
+local env, grp
+
+function sysCall_init()
+    -- Resolve handles
+    base   = sim.getObject('..')            -- robot base
+    tip    = sim.getObject('../IkTip')      -- IK tip dummy
+    target = sim.getObject('../IkTarget')   -- IK target dummy
+
+    -- Force target into world to avoid parenting side effects
+    sim.setObjectParent(target, -1, true)
+
+    -- Build IK environment/group (pose constraint)
+    env = simIK.createEnvironment()
+    grp = simIK.createGroup(env)
+    simIK.addElementFromScene(env, grp, base, tip, target, simIK.constraint_pose)
+
+    -- Optional: IK method tuning (usually not needed)
+    -- simIK.setGroupCalculation(env, grp, simIK.method_pseudo_inverse, 0.01, 50)
+
+    sim.addLog(sim.verbosity_scriptinfos, '[IRB4600-IK] follower init (threaded)')
+end
+
+function sysCall_thread()
+    -- One IK solve per simulation step
+    while true do
+        simIK.handleGroup(env, grp, {syncWorlds = true})
+        sim.step()
+    end
+end
+
+function sysCall_cleanup()
+    if env then simIK.eraseEnvironment(env) end
+end
